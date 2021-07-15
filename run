@@ -1,0 +1,2 @@
+#!/bin/bash
+bash tmp/server/bin/kotlin-language-server

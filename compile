@@ -1,0 +1,8 @@
+#!/bin/bash
+set -x;
+./gradlew :server:distZip
+rm -rf tmp/
+mkdir tmp/
+cp ./server/build/distributions/server.zip tmp
+cd tmp
+7z x server.zip
