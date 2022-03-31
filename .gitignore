@@ -1,24 +1,34 @@
+# General
+.DS_Store
+hs_err_*
+
+# Java/Eclipse/IDEA
 .settings
 .classpath
 .project
 .factorypath
 .gradle
-
 .idea
 *.iml
-
-lib-kotlin
 bin
 build
 target
 out
-__pycache__
-*.vsix
 
+# Python
+__pycache__
+
+# Node.js
 node_modules
 tmp
 .vscode-test
 
 .DS_Store
+=======
 
-hs_err_*
+# VSCode
+.vscode-test
+.vscode/*
+!.vscode/launch.json
+!.vscode/tasks.json
+*.vsix
