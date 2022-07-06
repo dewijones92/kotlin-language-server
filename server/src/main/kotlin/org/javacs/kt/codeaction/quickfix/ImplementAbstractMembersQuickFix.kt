@@ -11,6 +11,7 @@ import org.jetbrains.kotlin.descriptors.ClassDescriptor
 import org.jetbrains.kotlin.descriptors.ClassConstructorDescriptor
 import org.jetbrains.kotlin.descriptors.DeclarationDescriptor
 import org.jetbrains.kotlin.descriptors.FunctionDescriptor
+import org.jetbrains.kotlin.descriptors.PropertyDescriptor
 import org.jetbrains.kotlin.descriptors.isInterface
 import org.jetbrains.kotlin.descriptors.Modality
 import org.jetbrains.kotlin.js.resolve.diagnostics.findPsi
@@ -33,7 +34,7 @@ import org.jetbrains.kotlin.types.typeUtil.asTypeProjection
 
 private const val DEFAULT_TAB_SIZE = 4
 
-class ImplementAbstractFunctionsQuickFix : QuickFix {
+class ImplementAbstractMembersQuickFix : QuickFix {
     override fun compute(file: CompiledFile, index: SymbolIndex, range: Range, diagnostics: List<Diagnostic>): List<Either<Command, CodeAction>> {
         val diagnostic = findDiagnosticMatch(diagnostics, range)
 
@@ -43,28 +44,31 @@ class ImplementAbstractFunctionsQuickFix : QuickFix {
         
         // If the client side and the server side diagnostics contain a valid diagnostic for this range.
         if (diagnostic != null && anyDiagnosticMatch(kotlinDiagnostics, startCursor, endCursor)) {
-            // Get the class with the missing functions
+            // Get the class with the missing members
             val kotlinClass = file.parseAtPoint(startCursor)
             if (kotlinClass is KtClass) {
                 // Get the functions that need to be implemented
-                val functionsToImplement = getAbstractFunctionStubs(file, kotlinClass)
+                val membersToImplement = getAbstractMembersStubs(file, kotlinClass)
 
                 val uri = file.parse.toPath().toUri().toString()
-                // Get the padding to be introduced before the function declarations
+                // Get the padding to be introduced before the member declarations
                 val padding = getDeclarationPadding(file, kotlinClass)
-                // Get the location where the new code will be placed
-                val newFunctionStartPosition = getNewFunctionStartPosition(file, kotlinClass)
 
-                val textEdits = functionsToImplement.map {
-                    // We leave two new lines before the function is inserted
+                // Get the location where the new code will be placed
+                val newMembersStartPosition = getNewMembersStartPosition(file, kotlinClass)
+                val bodyAppendBeginning = listOf(TextEdit(Range(newMembersStartPosition, newMembersStartPosition), "{")).takeIf { kotlinClass.hasNoBody() } ?: emptyList()
+                val bodyAppendEnd = listOf(TextEdit(Range(newMembersStartPosition, newMembersStartPosition), System.lineSeparator() + "}")).takeIf { kotlinClass.hasNoBody() } ?: emptyList()
+
+                val textEdits = bodyAppendBeginning + membersToImplement.map {
+                    // We leave two new lines before the member is inserted
                     val newText = System.lineSeparator() + System.lineSeparator() + padding + it
-                    TextEdit(Range(newFunctionStartPosition, newFunctionStartPosition), newText)
-                }
+                    TextEdit(Range(newMembersStartPosition, newMembersStartPosition), newText)
+                } + bodyAppendEnd
 
                 val codeAction = CodeAction()
                 codeAction.edit = WorkspaceEdit(mapOf(uri to textEdits))
                 codeAction.kind = CodeActionKind.QuickFix
-                codeAction.title = "Implement abstract functions"
+                codeAction.title = "Implement abstract members"
                 codeAction.diagnostics = listOf(diagnostic)
                 return listOf(Either.forRight(codeAction))
             }
@@ -79,7 +83,7 @@ fun findDiagnosticMatch(diagnostics: List<Diagnostic>, range: Range) =
 private fun anyDiagnosticMatch(diagnostics: Diagnostics, startCursor: Int, endCursor: Int) =
     diagnostics.any { diagnosticMatch(it, startCursor, endCursor, hashSetOf("ABSTRACT_MEMBER_NOT_IMPLEMENTED", "ABSTRACT_CLASS_MEMBER_NOT_IMPLEMENTED")) }
 
-private fun getAbstractFunctionStubs(file: CompiledFile, kotlinClass: KtClass) =
+private fun getAbstractMembersStubs(file: CompiledFile, kotlinClass: KtClass) =
     // For each of the super types used by this class
     kotlinClass.superTypeListEntries.mapNotNull {
         // Find the definition of this super type
@@ -92,9 +96,13 @@ private fun getAbstractFunctionStubs(file: CompiledFile, kotlinClass: KtClass) =
         if (null != classDescriptor && (classDescriptor.kind.isInterface || classDescriptor.modality == Modality.ABSTRACT)) {
             val superClassTypeArguments = getSuperClassTypeProjections(file, it)
             classDescriptor.getMemberScope(superClassTypeArguments).getContributedDescriptors().filter { classMember ->
-               classMember is FunctionDescriptor && classMember.modality == Modality.ABSTRACT && !overridesDeclaration(kotlinClass, classMember)
-            }.map { function ->
-                createFunctionStub(function as FunctionDescriptor)
+               (classMember is FunctionDescriptor && classMember.modality == Modality.ABSTRACT && !overridesDeclaration(kotlinClass, classMember)) || (classMember is PropertyDescriptor && classMember.modality == Modality.ABSTRACT && !overridesDeclaration(kotlinClass, classMember))
+            }.mapNotNull { member ->
+                when (member) {
+                    is FunctionDescriptor -> createFunctionStub(member)
+                    is PropertyDescriptor -> createVariableStub(member)
+                    else -> null
+                }
             }
         } else {
             null
@@ -130,6 +138,11 @@ private fun overridesDeclaration(kotlinClass: KtClass, descriptor: FunctionDescr
         } else {
             false
         }
+    }
+
+private fun overridesDeclaration(kotlinClass: KtClass, descriptor: PropertyDescriptor): Boolean =
+    kotlinClass.declarations.any {
+        it.name == descriptor.name.asString() && it.hasModifier(KtTokens.OVERRIDE_KEYWORD)
     }
 
 // Checks if two functions have matching parameters
@@ -178,6 +191,11 @@ private fun createFunctionStub(function: FunctionDescriptor): String {
     return "override fun $name($arguments)${returnType?.let { ": $it" } ?: ""} { }"
 }
 
+private fun createVariableStub(variable: PropertyDescriptor): String {
+    val variableType = variable.returnType?.unwrappedType()?.toString()?.takeIf { "Unit" != it }
+    return "override val ${variable.name}${variableType?.let { ": $it" } ?: ""} = TODO(\"SET VALUE\")"
+}
+
 // about types: regular Kotlin types are marked T or T?, but types from Java are (T..T?) because nullability cannot be decided.
 // Therefore we have to unpack in case we have the Java type. Fortunately, the Java types are not marked nullable, so we default to non nullable types. Let the user decide if they want nullable types instead. With this implementation Kotlin types also keeps their nullability
 private fun KotlinType.unwrappedType(): KotlinType = this.unwrap().makeNullableAsSpecified(this.isMarkedNullable)
@@ -196,16 +214,21 @@ private fun getDeclarationPadding(file: CompiledFile, kotlinClass: KtClass): Str
     return " ".repeat(paddingSize)
 }
 
-private fun getNewFunctionStartPosition(file: CompiledFile, kotlinClass: KtClass): Position? =
-    // If the class is not empty, the new function will be put right after the last declaration
+private fun getNewMembersStartPosition(file: CompiledFile, kotlinClass: KtClass): Position? =
+    // If the class is not empty, the new member will be put right after the last declaration
     if (kotlinClass.declarations.isNotEmpty()) {
         val lastFunctionEndOffset = kotlinClass.declarations.last().endOffset
         position(file.content, lastFunctionEndOffset)
-    } else { // Otherwise, the function is put at the beginning of the class
+    } else { // Otherwise, the member is put at the beginning of the class
         val body = kotlinClass.body
         if (body != null) {
             position(file.content, body.startOffset + 1)
         } else {
-            null
+            // function has no body. We have to create one. New position is right after entire kotlin class text (with space)
+            val newPosCorrectLine = position(file.content, kotlinClass.startOffset + 1)
+            newPosCorrectLine.character = (kotlinClass.text.length + 2)
+            newPosCorrectLine
         }
     }
+
+private fun KtClass.hasNoBody() = null == this.body
